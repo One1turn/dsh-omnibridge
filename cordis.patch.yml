@@ -1,0 +1,9 @@
+# dsh-omnibridge：综合消息桥（参考 AstrBot 多平台接入架构）。
+#
+# allowFrom 默认空 = 拒绝所有入站（安全边界，防止提示注入前门）。
+# 配置放 DSH_HOME/settings.yaml 的 dsh-omnibridge 命名空间，或此处 config 覆盖。
+- insert:
+    - id: dsh-omnibridge
+      name: dsh-omnibridge
+      config:
+        allowFrom: []
