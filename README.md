@@ -4,7 +4,7 @@
 
 **差异化**：DSH 生态里其他 IM 桥（telegram / dsh-weixin-bot / dsh-feishu-bot / dsh-im-bridge 等）都是单平台插件；这是唯一一个 AstrBot 式多平台综合桥。
 
-## 平台覆盖矩阵（对标 AstrBot 19 平台）
+## 平台覆盖矩阵（参照 AstrBot 19 平台）
 
 | AstrBot 平台 | dsh-omnibridge channel | 方式 |
 | --- | --- | --- |
