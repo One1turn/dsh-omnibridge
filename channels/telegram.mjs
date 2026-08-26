@@ -8,7 +8,7 @@
  * @module dsh-omnibridge/channels/telegram
  */
 
-import { Channel, InboundMessage } from '../bridge-core.mjs'
+import { Channel, InboundMessage, splitForDelivery } from '../bridge-core.mjs'
 
 export class TelegramChannel extends Channel {
   constructor(config) {
@@ -47,6 +47,10 @@ export class TelegramChannel extends Channel {
     this.ctx = ctx
     this.bridge = bridge
     this.closed = false
+    // 启动即校验 token，坏 token 直接抛错（而不是进入每秒报错的轮询循环）
+    const me = await this.call('getMe', {}, 10000)
+    this.username = me?.username ? `@${me.username}` : ''
+    this.ctx?.logger?.info?.('[dsh-omnibridge:telegram] bot 已连接 %s', this.username || `(id ${me?.id ?? '?'})`)
     // 清掉旧 offset 前的挂起更新
     await this.call('getUpdates', { offset: -1, timeout: 1 }).catch(() => {})
     this.poll()
@@ -54,6 +58,7 @@ export class TelegramChannel extends Channel {
 
   async poll() {
     if (this.closed) return
+    let delay = this.config.pollIntervalMs || 1000
     try {
       const updates = await this.call('getUpdates', {
         offset: this.offset,
@@ -64,11 +69,17 @@ export class TelegramChannel extends Channel {
         this.offset = Math.max(this.offset, up.update_id + 1)
         this.handleUpdate(up)
       }
+      this.errorStreak = 0
     } catch (error) {
-      this.ctx?.logger?.warn?.('[dsh-omnibridge:telegram] poll error: %s', error instanceof Error ? error.message : String(error))
+      // 连续失败指数退避（上限 30s），避免坏 token/断网时每秒刷日志
+      this.errorStreak = (this.errorStreak || 0) + 1
+      const factor = Math.min(8, 2 ** this.errorStreak)
+      const jitter = 0.8 + Math.random() * 0.4 // 0.8~1.2，避免多实例同步"惊群"
+      delay = Math.min(30000, Math.floor(delay * factor * jitter))
+      this.ctx?.logger?.warn?.('[dsh-omnibridge:telegram] poll error (%d 连续): %s', this.errorStreak, error instanceof Error ? error.message : String(error))
     } finally {
       if (!this.closed) {
-        this.pollTimer = setTimeout(() => this.poll(), (this.config.pollIntervalMs || 1000))
+        this.pollTimer = setTimeout(() => this.poll(), delay)
         this.pollTimer.unref?.()
       }
     }
@@ -92,9 +103,13 @@ export class TelegramChannel extends Channel {
     })).catch(() => {})
   }
 
-  /** 发送文本。target = chat_id。 */
+  /** 发送文本。target = chat_id。Telegram 单条上限 4096 字符，超长自动分块。 */
   async send(target, text) {
-    await this.call('sendMessage', { chat_id: target, text })
+    const max = 4000 // 留余量（实体长度计入）
+    const chunks = splitForDelivery(text, max)
+    for (const chunk of chunks) {
+      await this.call('sendMessage', { chat_id: target, text: chunk })
+    }
   }
 
   async stop() {

@@ -16,7 +16,8 @@
  * @module dsh-omnibridge/channels/webhook
  */
 
-import { Channel, InboundMessage } from '../bridge-core.mjs'
+import { Channel, InboundMessage, splitForDelivery } from '../bridge-core.mjs'
+import { readJsonBody, respondJson } from './http-utils.mjs'
 
 export class WebhookChannel extends Channel {
   constructor(id, config) {
@@ -39,14 +40,16 @@ export class WebhookChannel extends Channel {
       this.ctx?.logger?.warn?.('[dsh-omnibridge:webhook:%s] webServer 服务不可用，入站禁用（出站仍可用）', this.id)
       return
     }
+    // 捕获 inject 的子上下文以便 stop() 能正确 dispose（修复 bridge rebuild 时的路由泄漏）
     ctx.inject(['webServer'], (routeCtx) => {
+      this.routeCtx = routeCtx
       routeCtx.effect(() => routeCtx.webServer.register({
         kind: 'exact',
         path: this.path,
         handler: async (request, response) => {
           try {
             if (request.method !== 'POST') { response.writeHead(405); response.end(); return }
-            const body = await readJson(request)
+            const body = await readJsonBody(request, { maxBytes: 1024 * 1024 })
             const parsed = this.parseInbound(body)
             if (parsed) {
               await this.bridge.handleInbound(parsed)
@@ -196,22 +199,33 @@ export class WebhookChannel extends Channel {
     }
     let payload
     if (this.format === 'line') {
-      // LINE 出站走 Reply API（需 channelAccessToken 与 replyToken）
-      if (!this.config.channelAccessToken || !target.startsWith('reply:')) {
-        this.ctx?.logger?.warn?.('[dsh-omnibridge:webhook:%s] LINE 出站需要 channelAccessToken + reply token', this.id)
+      // LINE 出站：优先 Reply API（一次性 replyToken），否则回退 Push API（需 channelAccessToken）
+      if (!this.config.channelAccessToken) {
+        this.ctx?.logger?.warn?.('[dsh-omnibridge:webhook:%s] LINE 出站需要 channelAccessToken', this.id)
         return
       }
-      const replyToken = target.slice('reply:'.length)
-      const resp = await fetch('https://api.line.me/v2/bot/message/reply', {
+      const headers = {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.config.channelAccessToken}`,
+      }
+      // LINE 单条消息上限 2000 字符；reply 一次可带 5 条，push 同理
+      const messages = splitForDelivery(text, 1900).slice(0, 5)
+        .map((t) => ({ type: 'text', text: t }))
+      let url = 'https://api.line.me/v2/bot/message/push'
+      let body
+      if (target.startsWith('reply:')) {
+        url = 'https://api.line.me/v2/bot/message/reply'
+        body = { replyToken: target.slice('reply:'.length), messages }
+      } else {
+        body = { to: target, messages }
+      }
+      const resp = await fetch(url, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.config.channelAccessToken}`,
-        },
-        body: JSON.stringify({ replyToken, messages: [{ type: 'text', text }] }),
+        headers,
+        body: JSON.stringify(body),
         signal: AbortSignal.timeout(10000),
       })
-      if (!resp.ok) throw new Error(`LINE reply -> ${resp.status}`)
+      if (!resp.ok) throw new Error(`LINE ${target.startsWith('reply:') ? 'reply' : 'push'} -> ${resp.status}`)
       return
     }
     if (this.format === 'mp') {
@@ -259,7 +273,13 @@ export class WebhookChannel extends Channel {
     }
   }
 
-  async stop() {}
+  async stop() {
+    // dispose 注入的 webServer 子上下文，解除路由注册（修复 bridge rebuild 泄漏）
+    if (this.routeCtx && typeof this.routeCtx.dispose === 'function') {
+      try { await this.routeCtx.dispose() } catch {}
+    }
+    this.routeCtx = null
+  }
 }
 
 /** 自动识别消息格式。 */
@@ -269,25 +289,6 @@ function detectFormat(body) {
   if (body?.MsgType) return 'wecom'
   if (body?.MsgType === 'text' || body?.MsgId || body?.MsgID) return 'mp'
   if (body?.text?.content && (body.msgtype === 'text' || body.senderStaffId)) return 'dingtalk'
-  if (body?.msgid && body?.text?.content && body?.tousername) return 'wecom_ai'
+  if (body?.msgid && body?.text?.content && body.tousername) return 'wecom_ai'
   return 'custom'
-}
-
-function readJson(request) {
-  return new Promise((resolve, reject) => {
-    const chunks = []
-    request.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
-    request.on('end', () => {
-      try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))
-      } catch (error) {
-        reject(error instanceof Error ? error : new Error('请求体不是合法 JSON'))
-      }
-    })
-  })
-}
-
-function respondJson(response, status, value) {
-  response.writeHead(status)
-  response.end(JSON.stringify(value))
 }

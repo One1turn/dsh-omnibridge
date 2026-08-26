@@ -109,7 +109,9 @@ export class OneBotChannel extends Channel {
       const senderId = String(data.user_id ?? '')
       if (self && senderId === self) return // 忽略自己的消息
       let text = ''
+      let atMe = false
       if (typeof data.raw_message === 'string') {
+        if (self) atMe = new RegExp(`\\[CQ:at,qq=${escapeRegExp(self)}[,\\]]`).test(data.raw_message)
         text = data.raw_message.replace(/\[CQ:[^\]]+\]/g, '').trim()
       } else if (Array.isArray(data.message)) {
         text = data.message
@@ -117,9 +119,13 @@ export class OneBotChannel extends Channel {
           .map((s) => String(s.data?.text ?? ''))
           .join('')
           .trim()
+        if (self) atMe = data.message.some((s) => s?.type === 'at' && String(s.data?.qq ?? '') === self)
       }
       if (!text) return
       const isGroup = data.message_type === 'group'
+      // 群聊默认只响应 @机器人，防止群里每条消息都驱动 agent（刷屏+放大消耗）；
+      // groupAtOnly=false 恢复全量响应。selfId 未就绪时放行，兼容连接初期窗口。
+      if (isGroup && this.config.groupAtOnly !== false && self && !atMe) return
       const target = isGroup ? `group:${data.group_id}` : `private:${senderId}`
       const sessionKey = isGroup ? `qq-group:${data.group_id}` : `qq-private:${senderId}`
       const senderName = data.sender?.card || data.sender?.nickname || senderId
@@ -151,4 +157,8 @@ export class OneBotChannel extends Channel {
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error('channel stopped')) }
     this.pending.clear()
   }
+}
+
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }

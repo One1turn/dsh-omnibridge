@@ -2,3 +2,6 @@ node_modules/
 config.json
 focus-data.json
 *.log
+weixin_oc.state.json
+AstrBot-master/
+*.Zone.Identifier

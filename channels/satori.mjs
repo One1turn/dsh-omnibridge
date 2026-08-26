@@ -152,7 +152,14 @@ export class SatoriChannel extends Channel {
 
   async stop() {
     this.closed = true
+    this.ready = false
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null }
     try { this.ws?.close() } catch {}
+    // 与 onebot 对齐：丢弃挂起的 RPC 回执
+    for (const p of this.pending.values()) {
+      if (p?.timer) clearTimeout(p.timer)
+      try { p?.reject?.(new Error('channel stopped')) } catch {}
+    }
+    this.pending.clear()
   }
 }

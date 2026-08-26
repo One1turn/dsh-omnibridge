@@ -6,6 +6,9 @@
  *   - telegram  Telegram（Bot API long polling）
  *   - webhook   通用 Webhook（飞书 / 企业微信 / 钉钉 / 自定义 JSON），
  *               入站走 DSH webServer，出站 POST 到机器人 webhook
+ *   - satori    Satori 网关
+ *   - webchat   内置 WebChat（HTTP，供浏览器测试）
+ *   - weixin_oc 个人微信（iLink 官方接口，自带二维码登录）
  *
  * 配置（DSH_HOME/settings.yaml）：
  *   dsh-omnibridge:
@@ -28,6 +31,10 @@
  *         format: auto          # auto|feishu|wecom|dingtalk|custom
  *         path: /dsh-omnibridge/webhook/feishu
  *         outboundUrl: ''
+ *     weixin_oc:
+ *       enabled: false
+ *       baseUrl: ''            # 留空用默认 https://ilinkai.weixin.qq.com
+ *       token: ''               # 留空启动时会扫码登录；登录后自动写回 state 文件
  *
  * 状态/设置 API：
  *   GET  /dsh-omnibridge/status
@@ -46,6 +53,8 @@ import { TelegramChannel } from './channels/telegram.mjs'
 import { WebhookChannel } from './channels/webhook.mjs'
 import { SatoriChannel } from './channels/satori.mjs'
 import { WebchatChannel } from './channels/webchat.mjs'
+import { WeixinOCChannel } from './channels/weixin_oc.mjs'
+import { readJsonBody, respondJson } from './channels/http-utils.mjs'
 
 const NAMESPACE = 'dsh-omnibridge'
 const CONFIG_FILE = join(fileURLToPath(new URL('.', import.meta.url)), 'config.json')
@@ -57,7 +66,7 @@ export const inject = ['settings', 'sessions', 'agents']
 const webhookSchema = z.object({
   id: z.string().required(),
   enabled: z.boolean().default(true),
-  format: z.enum(['auto', 'feishu', 'wecom', 'dingtalk', 'custom']).default('auto'),
+  format: z.union(['auto', 'feishu', 'wecom', 'wecom_ai', 'dingtalk', 'line', 'mp', 'custom']).default('auto'),
   path: z.string().default(''),
   outboundUrl: z.string().default(''),
 })
@@ -70,53 +79,65 @@ export const Config = z.object({
   agentModel: z.string().default(''),
   cwd: z.string().default(''),
   maxMessageChars: z.number().default(2000),
+  rateLimit: z.object({
+    // 每个发送方每窗口最大入站条数；0 或省略 = 不限速
+    maxPerMinute: z.number().default(0),
+    windowMs: z.number().default(60000),
+    // 命中限速时不回提示，仅记日志
+    silent: z.boolean().default(false),
+  }).default({}),
+  // 闲置会话路由自动清理分钟数；0 = 不自动清理（仍可 /gc 手动）
+  sessionTtlMinutes: z.number().default(0),
   onebot: z.object({
     enabled: z.boolean().default(true),
     url: z.string().default('ws://127.0.0.1:3001?access_token=%20'),
+    reconnectDelayMs: z.number().default(5000),
   }).default({}),
   telegram: z.object({
     enabled: z.boolean().default(false),
     token: z.string().default(''),
+    apiBase: z.string().default(''),
+    pollIntervalMs: z.number().default(1000),
   }).default({}),
   webhooks: z.array(webhookSchema).default([]),
   satori: z.object({
     enabled: z.boolean().default(false),
     baseUrl: z.string().default('http://127.0.0.1:5140'),
     token: z.string().default(''),
+    reconnectDelayMs: z.number().default(5000),
   }).default({}),
   webchat: z.object({
     enabled: z.boolean().default(false),
     path: z.string().default(''),
   }).default({}),
+  weixin_oc: z.object({
+    enabled: z.boolean().default(false),
+    baseUrl: z.string().default(''),
+    botType: z.string().default(''),
+    token: z.string().default(''),
+    accountId: z.string().default(''),
+    userId: z.string().default(''),
+    statePath: z.string().default(''),
+  }).default({}),
 })
 
+let enabledCache = null
 function readFileEnabled(fallback) {
+  if (enabledCache !== null) return enabledCache
   try {
     const parsed = JSON.parse(readFileSync(CONFIG_FILE, 'utf8'))
-    if (typeof parsed.enabled === 'boolean') return parsed.enabled
+    if (typeof parsed.enabled === 'boolean') {
+      enabledCache = parsed.enabled
+      return enabledCache
+    }
   } catch {}
-  return fallback
+  enabledCache = fallback
+  return enabledCache
 }
 function writeFileEnabled(enabled) {
+  enabledCache = enabled
   mkdirSync(dirname(CONFIG_FILE), { recursive: true })
   writeFileSync(CONFIG_FILE, JSON.stringify({ enabled }, null, 2), 'utf8')
-}
-function respondJson(response, status, value) {
-  response.writeHead(status)
-  response.end(JSON.stringify(value))
-}
-function requestJson(request) {
-  return new Promise((resolve, reject) => {
-    const chunks = []
-    request.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
-    request.on('end', () => {
-      try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))
-      } catch (error) {
-        reject(error instanceof Error ? error : new Error('请求体不是合法 JSON'))
-      }
-    })
-  })
 }
 
 /** 实例化 channel 列表。 */
@@ -144,6 +165,10 @@ function buildChannels(config) {
     ...(config.webchat || {}),
     name: 'WebChat (HTTP)',
   }))
+  channels.push(new WeixinOCChannel({
+    ...(config.weixin_oc || {}),
+    name: '个人微信 (iLink)',
+  }))
   return channels
 }
 
@@ -151,8 +176,8 @@ export function apply(ctx) {
   const scope = ctx.settings.register(NAMESPACE, Config, { applies: 'live' })
   let bridge = null
 
-  const startBridge = () => {
-    if (bridge) { void bridge.stop(); bridge = null }
+  const startBridge = async () => {
+    if (bridge) { const old = bridge; bridge = null; await old.stop() }
     const cfg = scope.get()
     if (!readFileEnabled(cfg.enabled)) return
     bridge = new Bridge(ctx, cfg, buildChannels(cfg))
@@ -160,7 +185,7 @@ export function apply(ctx) {
   }
 
   // settings 变更时重建
-  scope.on('update', () => startBridge())
+  scope.watch(() => startBridge())
   startBridge()
 
   ctx.inject(['webServer'], (routeCtx) => {
@@ -172,11 +197,13 @@ export function apply(ctx) {
         try {
           if (request.method !== 'GET' && request.method !== 'HEAD') { response.writeHead(405); response.end(); return }
           const channels = bridge ? bridge.channels.map((c) => c.meta()) : []
+          const summary = bridge ? bridge.statusSummary() : null
           respondJson(response, 200, {
             enabled: readFileEnabled(scope.get().enabled),
             channels,
-            routes: bridge ? bridge.routes.size : 0,
+            routes: summary ? summary.routes : 0,
             allowFrom: bridge ? bridge.allowFrom() : [],
+            summary,
           })
         } catch (error) {
           respondJson(response, 400, { error: error instanceof Error ? error.message : String(error) })
@@ -196,7 +223,7 @@ export function apply(ctx) {
             return
           }
           if (request.method === 'POST') {
-            const body = await requestJson(request)
+            const body = await readJsonBody(request)
             if (typeof body.enabled === 'boolean') {
               writeFileEnabled(body.enabled)
               startBridge()
