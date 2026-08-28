@@ -19,6 +19,9 @@
 import { Channel, InboundMessage, splitForDelivery } from '../bridge-core.mjs'
 import { readJsonBody, respondJson } from './http-utils.mjs'
 
+/** 出站 HTTP 超时。 */
+const HTTP_TIMEOUT_MS = 10000
+
 export class WebhookChannel extends Channel {
   constructor(id, config) {
     super(id, config)
@@ -68,127 +71,12 @@ export class WebhookChannel extends Channel {
     })
   }
 
-  /** 解析入站 JSON → InboundMessage | null。 */
+  /** 解析入站 JSON → InboundMessage | null（按 format 分发，解析器见文件底部映射表）。 */
   parseInbound(body) {
     if (!body || typeof body !== 'object') return null
     const fmt = this.format === 'auto' ? detectFormat(body) : this.format
-    if (fmt === 'feishu') {
-      // 飞书事件订阅
-      const eventType = body?.header?.event_type
-      if (eventType === 'im.message.receive_v1' || body?.event?.message) {
-        const event = body.event
-        const message = event?.message
-        let text = ''
-        try {
-          const content = JSON.parse(message?.content || '{}')
-          text = String(content.text ?? '')
-        } catch {}
-        if (!text.trim()) return null
-        const openId = String(event?.sender?.sender_id?.open_id ?? '')
-        const chatId = String(message?.chat_id ?? '')
-        const key = chatId || openId || 'default'
-        return new InboundMessage({
-          platform: this.id,
-          sessionKey: `feishu:${key}`,
-          senderId: openId || key,
-          senderName: openId || key,
-          text,
-          raw: { target: chatId || openId || key, messageId: String(message?.message_id ?? '') },
-        })
-      }
-      return null
-    }
-    if (fmt === 'wecom') {
-      // 企业微信回调（文本）
-      if (body?.MsgType === 'text') {
-        const from = String(body.FromUserName ?? '')
-        const to = String(body.ToUserName ?? '')
-        return new InboundMessage({
-          platform: this.id,
-          sessionKey: `wecom:${from || to}`,
-          senderId: from || to || 'unknown',
-          senderName: from || to || 'unknown',
-          text: String(body.Content ?? '').trim(),
-          raw: { target: from || to, messageId: String(body.MsgId ?? '') },
-        })
-      }
-      return null
-    }
-    if (fmt === 'dingtalk') {
-      // 钉钉（自定义机器人回调，需加解密，此处仅支持明文 text）
-      if (body?.text?.content) {
-        const senderId = String(body.senderNick ?? body.senderStaffId ?? 'unknown')
-        return new InboundMessage({
-          platform: this.id,
-          sessionKey: `ding:${senderId}`,
-          senderId,
-          senderName: senderId,
-          text: String(body.text.content).trim(),
-          raw: { target: senderId, messageId: String(body.msgId ?? '') },
-        })
-      }
-      return null
-    }
-    if (fmt === 'line') {
-      // LINE Messaging API：webhook 事件（text message）
-      const events = Array.isArray(body.events) ? body.events : []
-      for (const ev of events) {
-        if (ev.type !== 'message' || ev.message?.type !== 'text') continue
-        const userId = String(ev.source?.userId ?? ev.source?.groupId ?? '')
-        if (!userId) continue
-        return new InboundMessage({
-          platform: this.id,
-          sessionKey: `line:${userId}`,
-          senderId: userId,
-          senderName: userId,
-          text: String(ev.message.text ?? '').trim(),
-          raw: { target: userId, replyToken: ev.replyToken },
-          replyToken: ev.replyToken,
-        })
-      }
-      return null
-    }
-    if (fmt === 'mp') {
-      // 微信公众号（明文模式回调，XML 由网关层转 JSON 或原样字符串）
-      const text = String(body.Content ?? body.content ?? '').trim()
-      if (!text) return null
-      const from = String(body.FromUserName ?? body.from ?? 'unknown')
-      return new InboundMessage({
-        platform: this.id,
-        sessionKey: `mp:${from}`,
-        senderId: from,
-        senderName: from,
-        text,
-        raw: { target: from, messageId: String(body.MsgId ?? body.MsgID ?? '') },
-      })
-    }
-    if (fmt === 'wecom_ai') {
-      // 企业微信智能机器人回调
-      const text = String(body.text?.content ?? body.Content ?? '').trim()
-      if (!text) return null
-      const from = String(body.from ?? body.FromUserName ?? 'unknown')
-      return new InboundMessage({
-        platform: this.id,
-        sessionKey: `wecomai:${from}`,
-        senderId: from,
-        senderName: String(body.senderName ?? body.sender_name ?? from),
-        text,
-        raw: { target: from, messageId: String(body.msgid ?? '') },
-      })
-    }
-    // custom：{ text, sender_id?, session_key?, target? }
-    const text = String(body.text ?? body.content ?? body.message ?? '').trim()
-    if (!text) return null
-    const senderId = String(body.sender_id ?? body.sender ?? 'unknown')
-    const key = String(body.session_key ?? senderId)
-    return new InboundMessage({
-      platform: this.id,
-      sessionKey: `wh:${key}`,
-      senderId,
-      senderName: String(body.sender_name ?? senderId),
-      text,
-      raw: { target: String(body.target ?? key), messageId: String(body.message_id ?? '') },
-    })
+    const parser = inboundParsers[fmt]
+    return parser ? parser(this, body) : parseCustomInbound(this, body)
   }
 
   /** 发送文本：POST 到机器人 webhook。 */
@@ -223,7 +111,7 @@ export class WebhookChannel extends Channel {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(10000),
+        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
       })
       if (!resp.ok) throw new Error(`LINE ${target.startsWith('reply:') ? 'reply' : 'push'} -> ${resp.status}`)
       return
@@ -241,7 +129,7 @@ export class WebhookChannel extends Channel {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ touser: openid, msgtype: 'text', text: { content: text } }),
-          signal: AbortSignal.timeout(10000),
+          signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
         },
       )
       if (!resp.ok) throw new Error(`mp custom send -> ${resp.status}`)
@@ -282,7 +170,141 @@ export class WebhookChannel extends Channel {
   }
 }
 
-/** 自动识别消息格式。 */
+/**
+ * 每种平台格式的入站解析器：(channel, body) => InboundMessage | null。
+ * auto 模式先经 detectFormat 归类再分发；映射表未收录的走 custom 兜底。
+ */
+const inboundParsers = {
+  'feishu'(ch, body) {
+    // 飞书事件订阅
+    const eventType = body?.header?.event_type
+    if (eventType === 'im.message.receive_v1' || body?.event?.message) {
+      const event = body.event
+      const message = event?.message
+      let text = ''
+      try {
+        const content = JSON.parse(message?.content || '{}')
+        text = String(content.text ?? '')
+      } catch {}
+      if (!text.trim()) return null
+      const openId = String(event?.sender?.sender_id?.open_id ?? '')
+      const chatId = String(message?.chat_id ?? '')
+      const key = chatId || openId || 'default'
+      return new InboundMessage({
+        platform: ch.id,
+        sessionKey: `feishu:${key}`,
+        senderId: openId || key,
+        senderName: openId || key,
+        text,
+        raw: { target: chatId || openId || key, messageId: String(message?.message_id ?? '') },
+      })
+    }
+    return null
+  },
+  'wecom'(ch, body) {
+    // 企业微信回调（文本）
+    if (body?.MsgType === 'text') {
+      const from = String(body.FromUserName ?? '')
+      const to = String(body.ToUserName ?? '')
+      return new InboundMessage({
+        platform: ch.id,
+        sessionKey: `wecom:${from || to}`,
+        senderId: from || to || 'unknown',
+        senderName: from || to || 'unknown',
+        text: String(body.Content ?? '').trim(),
+        raw: { target: from || to, messageId: String(body.MsgId ?? '') },
+      })
+    }
+    return null
+  },
+  'dingtalk'(ch, body) {
+    // 钉钉（自定义机器人回调，需加解密，此处仅支持明文 text）
+    if (body?.text?.content) {
+      const senderId = String(body.senderNick ?? body.senderStaffId ?? 'unknown')
+      return new InboundMessage({
+        platform: ch.id,
+        sessionKey: `ding:${senderId}`,
+        senderId,
+        senderName: senderId,
+        text: String(body.text.content).trim(),
+        raw: { target: senderId, messageId: String(body.msgId ?? '') },
+      })
+    }
+    return null
+  },
+  'line'(ch, body) {
+    // LINE Messaging API：webhook 事件（text message）
+    const events = Array.isArray(body.events) ? body.events : []
+    for (const ev of events) {
+      if (ev.type !== 'message' || ev.message?.type !== 'text') continue
+      const userId = String(ev.source?.userId ?? ev.source?.groupId ?? '')
+      if (!userId) continue
+      return new InboundMessage({
+        platform: ch.id,
+        sessionKey: `line:${userId}`,
+        senderId: userId,
+        senderName: userId,
+        text: String(ev.message.text ?? '').trim(),
+        raw: { target: userId, replyToken: ev.replyToken },
+        replyToken: ev.replyToken,
+      })
+    }
+    return null
+  },
+  'mp'(ch, body) {
+    // 微信公众号（明文模式回调，XML 由网关层转 JSON 或原样字符串）
+    const text = String(body.Content ?? body.content ?? '').trim()
+    if (!text) return null
+    const from = String(body.FromUserName ?? body.from ?? 'unknown')
+    return new InboundMessage({
+      platform: ch.id,
+      sessionKey: `mp:${from}`,
+      senderId: from,
+      senderName: from,
+      text,
+      raw: { target: from, messageId: String(body.MsgId ?? body.MsgID ?? '') },
+    })
+  },
+  'wecom_ai'(ch, body) {
+    // 企业微信智能机器人回调
+    const text = String(body.text?.content ?? body.Content ?? '').trim()
+    if (!text) return null
+    const from = String(body.from ?? body.FromUserName ?? 'unknown')
+    return new InboundMessage({
+      platform: ch.id,
+      sessionKey: `wecomai:${from}`,
+      senderId: from,
+      senderName: String(body.senderName ?? body.sender_name ?? from),
+      text,
+      raw: { target: from, messageId: String(body.msgid ?? '') },
+    })
+  },
+}
+
+/** custom 兜底：{ text, sender_id?, session_key?, target? } */
+function parseCustomInbound(ch, body) {
+  const text = String(body.text ?? body.content ?? body.message ?? '').trim()
+  if (!text) return null
+  const senderId = String(body.sender_id ?? body.sender ?? 'unknown')
+  const key = String(body.session_key ?? senderId)
+  return new InboundMessage({
+    platform: ch.id,
+    sessionKey: `wh:${key}`,
+    senderId,
+    senderName: String(body.sender_name ?? senderId),
+    text,
+    raw: { target: String(body.target ?? key), messageId: String(body.message_id ?? '') },
+  })
+}
+
+/**
+ * 自动识别消息格式。
+ *
+ * 注意：企微与公众号回调字段高度重叠（都有 MsgType/Content/FromUserName），
+ * auto 模式无法可靠区分——MsgType 存在时优先按 wecom 处理是**有意保留的现状**
+ * （二者解析输出除 sessionKey 前缀外一致；改动会导致已部署会话路由失效）。
+ * 公众号接入请显式 format=mp。
+ */
 function detectFormat(body) {
   if (body?.header?.event_type || body?.event?.message?.content) return 'feishu'
   if (Array.isArray(body.events) && body.events.some((e) => e.type === 'message')) return 'line'

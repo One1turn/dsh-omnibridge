@@ -19,6 +19,10 @@
  */
 
 import { Channel, InboundMessage } from '../bridge-core.mjs'
+import { Reconnector, escapeRegExp } from './retry.mjs'
+
+/** HTTP 出站请求超时。 */
+const HTTP_TIMEOUT_MS = 10000
 
 export class SatoriChannel extends Channel {
   constructor(config) {
@@ -26,7 +30,7 @@ export class SatoriChannel extends Channel {
     this.ws = null
     this.pending = new Map()
     this.echoSeq = 0
-    this.reconnectTimer = null
+    this.reconnector = new Reconnector({ baseDelayMs: config.reconnectDelayMs || 5000 })
     this.closed = false
     this.ready = false
     this.selfId = this.config.selfId || null
@@ -85,23 +89,43 @@ export class SatoriChannel extends Channel {
   }
 
   scheduleReconnect() {
-    if (this.closed || this.reconnectTimer) return
-    const delay = this.config.reconnectDelayMs || 5000
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null
-      this.connect()
-    }, delay)
-    this.reconnectTimer.unref?.()
+    // 指数退避 + 抖动（Reconnector 内部管理 attempt，ready 帧时 reset）
+    this.reconnector.schedule(() => this.connect())
   }
 
   handleFrame(data) {
     if (data?.type === 'ready') {
       this.ready = true
       this.ctx?.logger?.info?.('[dsh-omnibridge:satori] ready')
+      // 鉴权握手成功才证明连接可用：退避归零；随后自识别 bot id（群聊 waking 用）
+      this.reconnector.reset()
+      if (!this.selfId) void this._fetchSelfId()
       return
     }
     if (data?.type === 'event' && data.body) {
       this.handleEvent(data.body)
+    }
+  }
+
+  /** ready 后自识别 bot id（Satori GET /v1/user/me），供群聊 waking 判定使用。 */
+  async _fetchSelfId() {
+    try {
+      const resp = await fetch(`${this.baseUrl}/v1/user/me`, {
+        headers: this.config.token ? { Authorization: `Bearer ${this.config.token}` } : {},
+        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+      })
+      if (!resp.ok) throw new Error(`status ${resp.status}`)
+      const data = await resp.json()
+      // 兼容裸 User 对象与 { data: User } 包裹两种响应
+      const id = String(data?.data?.id ?? data?.id ?? '')
+      if (!id) throw new Error('响应缺少 user id')
+      this.selfId = id
+      this.ctx?.logger?.info?.('[dsh-omnibridge:satori] 自识别 bot id=%s', id)
+    } catch (error) {
+      // 无法确定自身 id 时放行所有群消息（同 onebot「未就绪先放行」惯例）
+      if (!this.selfId) {
+        this.ctx?.logger?.warn?.('[dsh-omnibridge:satori] 获取 bot id 失败，群聊仅@唤醒降级为全量响应: %s', error instanceof Error ? error.message : String(error))
+      }
     }
   }
 
@@ -112,16 +136,31 @@ export class SatoriChannel extends Channel {
     if (!message) return
     // 忽略自己发的
     if (message.user?.id && this.selfId && message.user.id === this.selfId) return
-    // 提取纯文本（content 是含 At/图片的富文本，取 text 片段）
-    const content = message.content || ''
-    let text = ''
-    if (typeof content === 'string') {
-      text = content.replace(/<at[^>]*\/?>/g, '').replace(/<img[^>]*\/?>/g, '').trim()
-    }
-    if (!text) return
     const channelId = message.channel?.id || ''
     if (!channelId) return
     const guildId = message.guild?.id
+    const content = typeof message.content === 'string' ? message.content : ''
+
+    // 富文本里的图片在剥离前收集 src（字节由 Bridge 统一拉取落库）
+    const images = []
+    for (const m of content.matchAll(/<img[^>]*src=["']([^"']+)["']/gi)) {
+      const url = m[1]
+      if (/^https?:\/\//i.test(url)) images.push({ url })
+    }
+
+    // 群聊（有 guild）默认仅响应 @机器人 或引用机器人消息（对齐 AstrBot waking check）；
+    // groupAtOnly=false 恢复全量响应。at 检测必须在剥标签之前。
+    if (guildId && this.config.groupAtOnly !== false && this.selfId) {
+      const atMe = new RegExp(`<at[^>]*id=["']${escapeRegExp(String(this.selfId))}["']`, 'i').test(content)
+      const quotedMe = String(message.quote?.user?.id ?? '') === String(this.selfId)
+      if (!atMe && !quotedMe) return
+    }
+
+    // 提取纯文本（content 是含 At/图片的富文本，取 text 片段）
+    let text = ''
+    text = content.replace(/<at[^>]*\/?>/g, '').replace(/<img[^>]*\/?>/g, '').trim()
+    if (!text && !images.length) return
+
     const userId = message.user?.id || ''
     const sessionKey = guildId ? `satori:${guildId}:${channelId}` : `satori:${channelId}`
     const senderName = message.user?.name || message.user?.nick || userId
@@ -131,6 +170,7 @@ export class SatoriChannel extends Channel {
       senderId: userId || channelId,
       senderName,
       text,
+      images: images.length ? images : undefined,
       raw: { target: channelId, messageId: message.id, guildId },
     })).catch(() => {})
   }
@@ -145,7 +185,7 @@ export class SatoriChannel extends Channel {
         ...(this.config.token ? { Authorization: `Bearer ${this.config.token}` } : {}),
       },
       body: JSON.stringify({ channel_id: target, content: text }),
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
     })
     if (!resp.ok) throw new Error(`Satori message.create -> ${resp.status}`)
   }
@@ -153,7 +193,7 @@ export class SatoriChannel extends Channel {
   async stop() {
     this.closed = true
     this.ready = false
-    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null }
+    this.reconnector.close()
     try { this.ws?.close() } catch {}
     // 与 onebot 对齐：丢弃挂起的 RPC 回执
     for (const p of this.pending.values()) {

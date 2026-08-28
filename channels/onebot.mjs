@@ -10,6 +10,12 @@
  */
 
 import { Channel, InboundMessage } from '../bridge-core.mjs'
+import { Reconnector, escapeRegExp } from './retry.mjs'
+
+/** OneBot action 回执等待上限。 */
+const RPC_TIMEOUT_MS = 8000
+/** 登录信息查询回执上限。 */
+const LOGIN_TIMEOUT_MS = 5000
 
 export class OneBotChannel extends Channel {
   constructor(config) {
@@ -18,7 +24,7 @@ export class OneBotChannel extends Channel {
     this.pending = new Map()
     this.echoSeq = 0
     this.selfId = null
-    this.reconnectTimer = null
+    this.reconnector = new Reconnector({ baseDelayMs: config.reconnectDelayMs || 5000 })
     this.closed = false
   }
 
@@ -27,7 +33,7 @@ export class OneBotChannel extends Channel {
   }
 
   /** 发送 OneBot action 并等待回执。 */
-  call(action, params, timeoutMs = 8000) {
+  call(action, params, timeoutMs = RPC_TIMEOUT_MS) {
     return new Promise((resolve, reject) => {
       if (!this.ws || this.ws.readyState !== 1) {
         reject(new Error('OneBot WebSocket 未连接'))
@@ -64,8 +70,10 @@ export class OneBotChannel extends Channel {
     }
     this.ws.onopen = () => {
       this.ctx?.logger?.info?.('[dsh-omnibridge:onebot] connected to %s', this.url)
+      // 连接成功，退避归零
+      this.reconnector.reset()
       // 取 bot 自身 id 用于过滤自己的消息
-      this.call('get_login_info', {}, 5000).then((r) => {
+      this.call('get_login_info', {}, LOGIN_TIMEOUT_MS).then((r) => {
         if (r?.retcode === 0 && r?.data?.user_id) this.selfId = String(r.data.user_id)
       }).catch(() => {})
     }
@@ -84,13 +92,8 @@ export class OneBotChannel extends Channel {
   }
 
   scheduleReconnect() {
-    if (this.closed || this.reconnectTimer) return
-    const delay = this.config.reconnectDelayMs || 5000
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null
-      this.connect()
-    }, delay)
-    this.reconnectTimer.unref?.()
+    // 指数退避 + 抖动（Reconnector 内部管理 attempt，连接成功时 reset）
+    this.reconnector.schedule(() => this.connect())
   }
 
   handleMessage(data) {
@@ -110,8 +113,10 @@ export class OneBotChannel extends Channel {
       if (self && senderId === self) return // 忽略自己的消息
       let text = ''
       let atMe = false
+      const images = []
       if (typeof data.raw_message === 'string') {
         if (self) atMe = new RegExp(`\\[CQ:at,qq=${escapeRegExp(self)}[,\\]]`).test(data.raw_message)
+        collectCqImages(data.raw_message, images)
         text = data.raw_message.replace(/\[CQ:[^\]]+\]/g, '').trim()
       } else if (Array.isArray(data.message)) {
         text = data.message
@@ -120,8 +125,15 @@ export class OneBotChannel extends Channel {
           .join('')
           .trim()
         if (self) atMe = data.message.some((s) => s?.type === 'at' && String(s.data?.qq ?? '') === self)
+        for (const seg of data.message) {
+          if (seg?.type !== 'image') continue
+          const url = String(seg.data?.url || seg.data?.file || '')
+          if (/^https?:\/\//i.test(url)) {
+            images.push({ url, ...(seg.data?.file ? { name: String(seg.data.file).slice(0, 120) } : {}) })
+          }
+        }
       }
-      if (!text) return
+      if (!text && !images.length) return
       const isGroup = data.message_type === 'group'
       // 群聊默认只响应 @机器人，防止群里每条消息都驱动 agent（刷屏+放大消耗）；
       // groupAtOnly=false 恢复全量响应。selfId 未就绪时放行，兼容连接初期窗口。
@@ -135,6 +147,7 @@ export class OneBotChannel extends Channel {
         senderId,
         senderName,
         text,
+        images: images.length ? images : undefined,
         raw: { target, messageId: data.message_id },
       })).catch(() => {})
     }
@@ -152,13 +165,28 @@ export class OneBotChannel extends Channel {
 
   async stop() {
     this.closed = true
-    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null }
+    this.reconnector.close()
     try { this.ws?.close() } catch {}
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error('channel stopped')) }
     this.pending.clear()
   }
 }
 
-function escapeRegExp(s) {
-  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+/** OneBot CQ 码实体反转义（url 等值内含的 &, [, ], 逗号会被转义）。 */
+function cqUnescape(s) {
+  return String(s || '')
+    .replace(/&amp;/g, '&')
+    .replace(/&#91;/g, '[')
+    .replace(/&#93;/g, ']')
+    .replace(/&comma;/g, ',')
+}
+
+/** 从 raw_message 的 [CQ:image,…] 码中收集图片下载地址（剥离前调用）。 */
+function collectCqImages(rawMessage, out) {
+  for (const m of String(rawMessage).matchAll(/\[CQ:image,[^\]]*\]/g)) {
+    const url = cqUnescape(/(?:^|[&,])url=([^,\]]*)/.exec(m[0])?.[1] || '')
+    if (!/^https?:\/\//i.test(url)) continue
+    const file = cqUnescape(/(?:^|[&,])file=([^,\]]*)/.exec(m[0])?.[1] || '')
+    out.push({ url, ...(file ? { name: file.slice(0, 120) } : {}) })
+  }
 }

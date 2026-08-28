@@ -40,7 +40,7 @@ export class Channel {
 
 /** 统一入站消息（对标 AstrBotMessage 精简）。 */
 export class InboundMessage {
-  constructor({ platform, sessionKey, senderId, senderName, text, raw, replyToken }) {
+  constructor({ platform, sessionKey, senderId, senderName, text, raw, replyToken, images }) {
     this.platform = platform
     this.sessionKey = sessionKey
     this.senderId = senderId
@@ -48,6 +48,11 @@ export class InboundMessage {
     this.text = text || ''
     this.raw = raw
     this.replyToken = replyToken || null
+    /**
+     * 入站图片描述列表（channel 只负责提取，Bridge 统一取字节并经 attachments 落库）：
+     * { url?: 'https://…' } 或 { dataUrl?: 'data:image/png;base64,…' }，均可带 name。
+     */
+    this.images = Array.isArray(images) && images.length ? images : null
     this.timestamp = Date.now()
   }
 }
@@ -62,15 +67,19 @@ export function helpText(config) {
   const lines = [
     '🤖 dsh-omnibridge 命令：',
     '/new <提示词> — 新建会话并开始',
-    '/sessions — 列出当前桥的会话',
-    '/switch <id> — 切换活动会话',
+    '/reset — 重置当前会话（清空上下文重新开始）',
+    '/sessions — 列出当前桥的会话（管理员）',
+    '/switch <id> — 切换活动会话（管理员）',
     '/status — 当前活动会话',
-    '/gc [分钟] — 清理闲置超时的会话（默认 30 分钟）',
-    '/model [provider/]model — 查看/切换模型（如 /model ai/gpt-5.6-luna）',
+    '/gc [分钟] — 清理闲置超时的会话路由（管理员，默认 30 分钟）',
+    '/model [provider/]model — 查看/切换模型（管理员，如 /model ai/gpt-5.6-luna）',
     '/help — 本帮助',
   ]
   if (config.allowedCommands?.length) {
     lines.push('自定义命令：' + config.allowedCommands.join(' '))
+  }
+  if (config.admins?.length) {
+    lines.push('提示：标注（管理员）的命令仅限 admins 名单内的发送者使用。')
   }
   return lines.join('\n')
 }
@@ -80,6 +89,63 @@ function parseAllowList(raw) {
   if (Array.isArray(raw)) return raw.map(String).filter(Boolean)
   if (typeof raw === 'string' && raw.trim()) return raw.split(/[,，;；\s]+/).filter(Boolean)
   return []
+}
+
+/** 管理员专属命令集（对齐 AstrBot 权限分级）。 */
+const ADMIN_COMMANDS = new Set(['/model', '/gc', '/sessions', '/switch'])
+
+/**
+ * 唤醒前缀匹配（对齐 AstrBot waking 的前缀模式）：命中最长前缀即剥离。
+ * 未配置前缀时视为全部匹配（行为与不启用完全一致）。
+ * @returns {{ matched: boolean, rest: string }} matched=false 表示未携带任何前缀
+ */
+export function applyWakePrefixes(text, prefixes) {
+  const list = (Array.isArray(prefixes) ? prefixes : [])
+    .map((p) => String(p))
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length)
+  if (!list.length) return { matched: true, rest: text }
+  for (const p of list) {
+    if (text.startsWith(p)) return { matched: true, rest: text.slice(p.length).trim() }
+  }
+  return { matched: false, rest: '' }
+}
+
+// —— 入站媒体：主机安全防护 + 字节来源解析 ——
+
+/** 视为私网/本机的 hostname（尽力而为的字面量检查，DNS rebinding 不在此防线内）。 */
+const PRIVATE_HOST_RE = /^(localhost|::1|\[::1\]|0\.0\.0\.0|(?:127|10)\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|169\.254\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+)$/i
+
+/**
+ * 入站图片抓取地址防护：仅 http(s)，默认拒绝 loopback/私网地址字面量。
+ * 自托管平台（如本机 NapCat）的局域网媒体地址可用 mediaAllowPrivateHosts 放行。
+ */
+export function isInboundImageUrlAllowed(rawUrl) {
+  let u
+  try { u = new URL(String(rawUrl)) } catch { return false }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false
+  return !PRIVATE_HOST_RE.test(u.hostname)
+}
+
+const DATA_URL_RE = /^data:(image\/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/=\s]+)$/i
+
+/** 解析 data:image/*;base64,... → attachments 输入；非法返回 null。 */
+export function decodeImageDataUrl(dataUrl) {
+  const m = DATA_URL_RE.exec(String(dataUrl || '').trim())
+  if (!m) return null
+  const buf = Buffer.from(m[2], 'base64')
+  if (!buf.length) return null
+  return { data: new Uint8Array(buf), mediaType: m[1].toLowerCase() }
+}
+
+const EXT_MEDIA_TYPE = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' }
+
+/** 从响应 Content-Type 或 URL 扩展名推断图片媒体类型；推断不出返回 null。 */
+export function imageMediaTypeFrom(contentType, urlPath) {
+  const ct = String(contentType || '').split(';')[0].trim().toLowerCase()
+  if (ct.startsWith('image/')) return ct
+  const ext = /\.([a-z0-9]+)(?:[?#]|$)/i.exec(String(urlPath || ''))
+  return ext ? (EXT_MEDIA_TYPE[ext[1].toLowerCase()] || null) : null
 }
 
 /** 速率限制器：每 senderId 一个滑动窗口。 */
@@ -110,6 +176,9 @@ class RateLimiter {
   clear() { this.buckets.clear() }
 }
 
+/** 入站图片下载超时。 */
+const MEDIA_FETCH_TIMEOUT_MS = 15000
+
 /**
  * Bridge：综合桥主体。
  * @param {object} ctx Cordis Context
@@ -122,6 +191,7 @@ export class Bridge {
     this.config = config
     this.channels = channels
     this.allowList = parseAllowList(this.config.allowFrom)
+    this.adminList = parseAllowList(this.config.admins)
     /** sessionKey → { sessionId, target, channel, replyToken, lastActive } */
     this.routes = new Map()
     /** sessionId → route（反向） */
@@ -147,28 +217,37 @@ export class Bridge {
   }
 
   /**
-   * 白名单判定。支持：
+   * 名单匹配共享逻辑（allowFrom / admins 同语法）。支持：
    *  - '*'：放行所有
    *  - '<senderId>'：精确匹配发送者（平台原始 id）
    *  - '<platform>:*'：放行整个平台（如 onebot:*）
    *  - '<platform>:<id>'：平台 + 平台内 id 精确匹配（如 tg:12345）
-   *  支持转发等带前缀的 senderId：若 senderId 形如 'onebot:12345'，则同时匹配 'onebot:*' 精确段。
-   * 空表 = 拒绝一切（安全边界）。
+   * 兼容 senderId 形如 "platform:id" 的转发场景。空表 = 不匹配任何人。
    */
-  isAllowed(msg) {
-    const allow = this.allowFrom()
-    if (allow.length === 0) return false
-    if (allow.includes('*')) return true
-    if (allow.includes(msg.senderId)) return true
-    // 平台级匹配：用消息平台的 id（this 是 channel 维度，msg.platform 即 channelId）
-    if (allow.includes(`${msg.platform}:*`)) return true
-    // 兼容 senderId 形如 "platform:id" 的情况
+  _match(list, msg) {
+    if (!list.length) return false
+    if (list.includes('*')) return true
+    if (list.includes(msg.senderId)) return true
+    if (list.includes(`${msg.platform}:*`)) return true
     if (msg.senderId && msg.senderId.includes(':')) {
       const [plat] = msg.senderId.split(':')
-      if (plat && allow.includes(`${plat}:*`)) return true
+      if (plat && list.includes(`${plat}:*`)) return true
     }
-    if (allow.includes(`${msg.platform}:${msg.senderId}`)) return true
-    return false
+    return list.includes(`${msg.platform}:${msg.senderId}`)
+  }
+
+  /** 白名单判定（空表 = 拒绝一切，安全边界）。 */
+  isAllowed(msg) {
+    return this._match(this.allowList, msg)
+  }
+
+  /**
+   * 管理员判定。admins 未配置时白名单内全员视为管理员（兼容单人部署现状）；
+   * 配置后受限命令（/model /gc /sessions /switch）仅名单成员可用。
+   */
+  isAdmin(msg) {
+    if (!this.adminList.length) return true
+    return this._match(this.adminList, msg)
   }
 
   /** 启动所有 channel。 */
@@ -210,13 +289,22 @@ export class Bridge {
   /** 入站统一入口（channel 调用）。 */
   async handleInbound(msg) {
     if (!(msg instanceof InboundMessage)) return
-    const text = (msg.text || '').trim()
-    if (!text) return
+    let text = (msg.text || '').trim()
+    const hasImages = !!msg.images?.length
+    if (!text && !hasImages) return
 
     // 白名单
     if (!this.isAllowed(msg)) {
       this.ctx.logger?.debug?.('[dsh-omnibridge] 拒绝未加白发送方 %s', msg.senderId)
       return
+    }
+
+    // 唤醒前缀（对齐 AstrBot waking check）：配置后普通文本消息必须携带任一前缀；
+    // '/' 命令与纯图消息豁免（纯图无文本可剥）
+    if (text && !text.startsWith('/')) {
+      const wake = applyWakePrefixes(text, this.config.wakePrefixes)
+      if (!wake.matched || !wake.rest.trim()) return
+      text = wake.rest.trim()
     }
 
     // 速率限制（命令也限，防止刷屏注入）
@@ -227,10 +315,28 @@ export class Bridge {
       return
     }
 
-    // 命令
+    // 命令（只看文本；纯图片消息不可能命中命令分支）
     if (text.startsWith('/')) {
       await this.handleCommand(msg, text)
       return
+    }
+
+    // 图片落库：先于 turn 提交。附件服务缺失/全部失败时按有无文本决定降级或拒收
+    let imageBlocks = []
+    if (hasImages) {
+      try {
+        imageBlocks = await this.resolveImages(msg)
+      } catch (error) {
+        this.ctx.logger?.warn?.('[dsh-omnibridge] 图片接收不可用: %s', error instanceof Error ? error.message : String(error))
+        if (!text) {
+          await this.reply(msg, `⚠️ 图片接收失败：${error instanceof Error ? error.message : String(error)}`)
+          return
+        }
+      }
+      if (!imageBlocks.length && !text) {
+        await this.reply(msg, '⚠️ 图片全部接收失败，未处理该消息。')
+        return
+      }
     }
 
     // 路由到 agent
@@ -252,11 +358,61 @@ export class Bridge {
       await this.reply(msg, '💤 会话正在准备中，请稍后重试，或发送 /new <提示词> 新建会话。')
       return
     }
-    const userMsg = createUserMessage({
-      content: [{ type: 'text', text }],
+    const content = []
+    if (text) content.push({ type: 'text', text })
+    content.push(...imageBlocks)
+    agent.followup(createUserMessage({
+      content,
       source: { kind: 'user' },
-    })
-    agent.followup(userMsg)
+    }))
+  }
+
+  /**
+   * 入站图片 → attachments 落库 → image 内容块（对齐 AstrBot 图片组件入站）。
+   * attachments 服务缺失时抛错，由调用方决定降级；单张失败跳过不阻塞其余。
+   */
+  async resolveImages(msg) {
+    const store = this.ctx.attachments
+    if (!store?.saveImage) throw new Error('附件存储服务不可用（ctx.attachments 缺失）')
+    const limits = store.imageLimits || {}
+    const maxImages = Math.max(1, Number(limits.maxImagesPerMessage) || 4)
+    const maxBytes = Math.max(1024, Number(limits.maxImageBytes) || 10 * 1024 * 1024)
+    const blocks = []
+    for (const img of msg.images.slice(0, maxImages)) {
+      try {
+        const input = await this._inboundImageInput(img, maxBytes)
+        blocks.push({ type: 'image', attachment: await store.saveImage(input) })
+      } catch (error) {
+        this.ctx.logger?.warn?.('[dsh-omnibridge] 图片落库失败(%s): %s',
+          img?.name || img?.url || 'unnamed', error instanceof Error ? error.message : String(error))
+      }
+    }
+    return blocks
+  }
+
+  /** 单张图片描述 → SaveImageAttachment 输入（dataUrl 解码或 url 拉取，含尺寸/类型校验）。 */
+  async _inboundImageInput(img, maxBytes) {
+    const name = img?.name ? String(img.name).slice(0, 120) : undefined
+    if (img?.dataUrl) {
+      const decoded = decodeImageDataUrl(img.dataUrl)
+      if (!decoded) throw new Error('无法解析的 dataUrl')
+      if (decoded.data.byteLength > maxBytes) throw new Error(`图片超过 ${maxBytes} 字节上限`)
+      return { ...decoded, ...(name ? { name } : {}) }
+    }
+    const url = String(img?.url || '')
+    if (!url) throw new Error('图片缺少 url/dataUrl')
+    if (!this.config.mediaAllowPrivateHosts && !isInboundImageUrlAllowed(url)) {
+      throw new Error('地址被媒体安全策略拒绝（私网/非 http(s)；自托管平台可用 mediaAllowPrivateHosts 放行）')
+    }
+    const resp = await fetch(url, { signal: AbortSignal.timeout(MEDIA_FETCH_TIMEOUT_MS) })
+    if (!resp.ok) throw new Error(`下载失败 status ${resp.status}`)
+    const declaredLen = Number(resp.headers.get('content-length')) || 0
+    if (declaredLen > maxBytes) throw new Error(`图片超过 ${maxBytes} 字节上限`)
+    const buf = Buffer.from(await resp.arrayBuffer())
+    if (buf.length > maxBytes) throw new Error(`图片超过 ${maxBytes} 字节上限`)
+    const mediaType = imageMediaTypeFrom(resp.headers.get('content-type'), url)
+    if (!mediaType) throw new Error('无法识别图片类型（响应头与扩展名均无 image 信息）')
+    return { data: new Uint8Array(buf), mediaType, ...(name ? { name } : {}) }
   }
 
   // 确保 session 存在：已有则复用，没有则创建。避免重复 create 报 already exists。
@@ -326,6 +482,11 @@ export class Bridge {
     try {
       const [cmd, ...rest] = text.split(/\s+/)
       const arg = rest.join(' ').trim()
+      // 管理员分级（对齐 AstrBot 权限体系）：admins 为空时全员即管理员
+      if (ADMIN_COMMANDS.has(cmd) && !this.isAdmin(msg)) {
+        await this.reply(msg, '⛔ 该命令需要管理员权限。')
+        return
+      }
       switch (cmd) {
         case '/help': {
           await this.reply(msg, helpText(this.config))
@@ -333,6 +494,10 @@ export class Bridge {
         }
         case '/new': {
           await this.createSession(msg, arg)
+          return
+        }
+        case '/reset': {
+          await this.resetSession(msg)
           return
         }
         case '/sessions': {
@@ -482,6 +647,30 @@ export class Bridge {
     }
   }
 
+  /**
+   * 重置当前绑定会话（对齐 AstrBot /reset 清空上下文语义）：
+   * 释放旧 agent，route 重指新 sessionId，绑定关系与一次性 replyToken 一并清理。
+   */
+  async resetSession(msg) {
+    const route = this.routes.get(msg.sessionKey)
+    if (!route) {
+      await this.reply(msg, '当前无会话，直接发消息即可开始。')
+      return
+    }
+    const oldId = route.sessionId
+    try {
+      const oldAgent = this.ctx.agents.get(oldId)
+      if (oldAgent?.dispose) oldAgent.dispose()
+    } catch {}
+    this.routesBySession.delete(oldId)
+    route.sessionId = newSessionId(msg.platform)
+    route.agentPromise = null
+    route.replyToken = null
+    route.lastActive = Date.now()
+    this.routesBySession.set(route.sessionId, route)
+    await this.reply(msg, `♻️ 会话已重置（原 ${oldId}），上下文已清空。直接发消息开始新对话。`)
+  }
+
   /** 新建会话。 */
   async createSession(msg, prompt) {
     const route = this.routeFor(msg)
@@ -528,6 +717,10 @@ export class Bridge {
       const route = this.routesBySession.get(String(session.id))
       if (!route) return
       if (event.type === 'turn/start') {
+        // 先挂「回合进行中」标记再发 ack：sendOutbound 同步执行到 ch.send()，
+        // 顺序颠倒会让 ack 的静默期定时器抢在标记之前武装（wait=true 提前返回）
+        const startCh = this.channelOf(route.channelId)
+        try { startCh?.onTurnStart?.(route.target) } catch {}
         if (this.config.ackTurnStart !== false) void sendOutbound(route, '⏳ 收到，开始处理…')
         return
       }

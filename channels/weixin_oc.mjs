@@ -23,6 +23,8 @@
  */
 
 import { Channel, InboundMessage, splitForDelivery } from '../bridge-core.mjs'
+import { backoffDelayMs, sleep } from './retry.mjs'
+import { readJsonBody, respondJson } from './http-utils.mjs'
 import { randomUUID, randomBytes } from 'node:crypto'
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
@@ -34,6 +36,8 @@ const LONG_POLL_MS = 35000
 const API_TIMEOUT_MS = 15000
 const QR_POLL_HEADER = { 'iLink-App-ClientVersion': '1' }
 const API_PREFIX = '/dsh-omnibridge'
+/** 高频字段（syncBuf/contextTokens）写盘去抖窗口。 */
+const PERSIST_DEBOUNCE_MS = 2000
 
 export class WeixinOCChannel extends Channel {
   constructor(config) {
@@ -56,6 +60,7 @@ export class WeixinOCChannel extends Channel {
     this.qrContent = ''
     this.qrPng = null
     this.qrUrl = ''
+    this.qrUpdatedAt = 0
     this.routesRegistered = false
     // 恢复持久化的 context_tokens（避免重启丢失、导致首次回复失败）
     try {
@@ -97,6 +102,34 @@ export class WeixinOCChannel extends Channel {
       mkdirSync(dirname(this.statePath), { recursive: true })
       writeFileSync(this.statePath, JSON.stringify(next, null, 2), 'utf8')
     } catch {}
+    // 立即写已覆盖全量状态，取消挂起的去抖冲刷
+    this._persistDirty = false
+    if (this._persistTimer) { clearTimeout(this._persistTimer); this._persistTimer = null }
+  }
+
+  /**
+   * 高频字段（syncBuf / contextTokens）写盘去抖：尾沿窗口内合并为一次磁盘写。
+   * 每次长轮询回包都会推进 syncBuf，逐条同步读改写毫无必要；
+   * bot_token 等关键状态转换仍直接走 _writeState()（丢失要重新扫码）。
+   */
+  _schedulePersist(delayMs = PERSIST_DEBOUNCE_MS) {
+    this._persistDirty = true
+    if (this._persistTimer) return
+    this._persistTimer = setTimeout(() => {
+      this._persistTimer = null
+      if (!this._persistDirty) return
+      this._persistDirty = false
+      this._writeState()
+    }, delayMs)
+    this._persistTimer.unref?.()
+  }
+
+  /** 冲刷挂起脏数据（stop 时调用，防正常退出丢 context_token）。 */
+  _flushPersist() {
+    if (this._persistTimer) { clearTimeout(this._persistTimer); this._persistTimer = null }
+    if (!this._persistDirty) return
+    this._persistDirty = false
+    this._writeState()
   }
 
   // —— HTTP 基础 ——
@@ -186,6 +219,57 @@ export class WeixinOCChannel extends Channel {
             response.end(self.qrContent || 'no qr code yet')
           },
         }), 'dsh-omnibridge weixin_oc qrcode txt')
+
+        // 登录状态查询（扫码登录面板轮询用）
+        routeCtx.effect(() => routeCtx.webServer.register({
+          kind: 'exact',
+          path: `${API_PREFIX}/weixin_oc/login-status`,
+          handler: async (request, response) => {
+            try {
+              if (request.method !== 'GET' && request.method !== 'HEAD') { response.writeHead(405); response.end(); return }
+              respondJson(response, 200, {
+                loggedIn: !!self.token,
+                loggingIn: !!self._loginPromise,
+                hasQr: !!self.qrPng,
+                qrUrl: `${API_PREFIX}/weixin_oc/qrcode.png`,
+                qrUpdatedAt: self.qrUpdatedAt || null,
+              })
+            } catch (error) {
+              respondJson(response, 400, { error: error instanceof Error ? error.message : String(error) })
+            }
+          },
+        }), 'dsh-omnibridge weixin_oc login-status')
+
+        // 手动刷新二维码：登录流程进行中仅重取二维码（不动轮询）；未在登录则后台拉起登录流程。
+        // {restart:true}：退出当前登录态（旧 token 备份进 state.previousToken）并重新出码扫码。
+        routeCtx.effect(() => routeCtx.webServer.register({
+          kind: 'exact',
+          path: `${API_PREFIX}/weixin_oc/qr-refresh`,
+          handler: async (request, response) => {
+            try {
+              if (request.method !== 'POST') { response.writeHead(405); response.end(); return }
+              const body = await readJsonBody(request).catch(() => ({}))
+              if (self.token && body.restart !== true) { respondJson(response, 200, { ok: true, loggedIn: true }); return }
+              if (self.token && body.restart === true) {
+                const prev = self.token
+                self.token = ''
+                self.accountId = ''
+                self.userId = ''
+                self._writeState({ token: '', accountId: '', userId: '', previousToken: prev })
+                self.contextTokens.clear()
+                void self._loginFlow().catch(() => {})
+                respondJson(response, 200, { ok: true, restarted: true, loggingIn: true })
+                return
+              }
+              // 未登录：确保扫码轮询流程在跑（否则只出码、扫了没反应），再等首张二维码落地
+              if (!self._loginPromise) void self._loginFlow().catch(() => {})
+              for (let i = 0; i < 16 && !self.qrPng && !self.closed; i++) await sleep(500)
+              respondJson(response, 200, { ok: !!self.qrPng, hasQr: !!self.qrPng, loggingIn: !!self._loginPromise, qrUpdatedAt: self.qrUpdatedAt || null })
+            } catch (error) {
+              respondJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
+            }
+          },
+        }), 'dsh-omnibridge weixin_oc qr-refresh')
       })
     } catch (e) {
       this.ctx?.logger?.warn?.('[dsh-omnibridge:weixin_oc] 注册二维码路由失败: %s', e?.message || e)
@@ -261,6 +345,7 @@ export class WeixinOCChannel extends Channel {
     // qrcode_img_content 是登录链（AstrBot 也这么用），用 qrserver 渲染成 PNG
     this.qrContent = img
     this.qrPng = null
+    this.qrUpdatedAt = Date.now()
     if (img) {
       try {
         const url = `https://api.qrserver.com/v1/create-qr-code/?size=420x420&margin=8&data=${encodeURIComponent(img)}`
@@ -318,6 +403,7 @@ export class WeixinOCChannel extends Channel {
   async _pollInboundLoop() {
     if (this.polling) return
     this.polling = true
+    let errorStreak = 0
     while (!this.closed) {
       // 重登期间无 token：等登录流程产出，不打空 API
       if (!this.token) {
@@ -326,9 +412,12 @@ export class WeixinOCChannel extends Channel {
       }
       try {
         await this._pollInboundOnce()
+        errorStreak = 0
       } catch (e) {
-        this.ctx?.logger?.warn?.('[dsh-omnibridge:weixin_oc] inbound 轮询错误: %s', e?.message || e)
-        await sleep(5_000)
+        // 连续错误指数退避（封顶 30s）：断网/服务端异常时不再固定节奏打点
+        errorStreak++
+        this.ctx?.logger?.warn?.('[dsh-omnibridge:weixin_oc] inbound 轮询错误(连续 %d): %s', errorStreak, e?.message || e)
+        await sleep(backoffDelayMs(errorStreak, 5000))
       }
     }
     this.polling = false
@@ -371,7 +460,7 @@ export class WeixinOCChannel extends Channel {
       if (!msg || typeof msg !== 'object') continue
       this._handleInbound(msg).catch(() => {})
     }
-    if (dirty) this._writeState()
+    if (dirty) this._schedulePersist()
   }
 
   _isSessionTimeout(data) {
@@ -387,7 +476,7 @@ export class WeixinOCChannel extends Channel {
     const ctxTok = String(msg?.context_token ?? '').trim()
     if (ctxTok && this.contextTokens.get(fromUserId) !== ctxTok) {
       this.contextTokens.set(fromUserId, ctxTok)
-      this._writeState()
+      this._schedulePersist()
     }
     const itemList = Array.isArray(msg?.item_list) ? msg.item_list : []
     const text = this._textFromItems(itemList)
@@ -454,16 +543,10 @@ export class WeixinOCChannel extends Channel {
   async stop() {
     this.closed = true
     // 长轮询靠 AbortSignal.timeout 自然超时，无需显式 cancel
+    this._flushPersist()
     if (this.routeCtx && typeof this.routeCtx.dispose === 'function') {
       try { await this.routeCtx.dispose() } catch {}
     }
     this.routeCtx = null
   }
-}
-
-function sleep(ms) {
-  return new Promise((r) => {
-    const t = setTimeout(r, ms)
-    t.unref?.()
-  })
 }
